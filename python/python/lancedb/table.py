@@ -443,6 +443,18 @@ def _into_pyarrow_reader(
         )
 
 
+def _is_add_columns_data(data: Any) -> bool:
+    """Whether ``add_columns`` was given column values rather than SQL transforms."""
+    if isinstance(data, (pa.Table, pa.RecordBatch, pa.RecordBatchReader)):
+        return True
+    if _check_for_pandas(data) and isinstance(data, pd.DataFrame):
+        return True
+    return (
+        type(data).__module__.startswith("polars")
+        and type(data).__name__ == "DataFrame"
+    )
+
+
 def _iterator_to_reader(data: Iterable) -> pa.RecordBatchReader:
     # Each batch is treated as it's own reader, mainly so we can
     # re-use the _into_pyarrow_reader logic.
@@ -2427,6 +2439,10 @@ class Table(ABC):
         | pa.Field
         | List[pa.Field]
         | pa.Schema
+        | pa.Table
+        | pa.RecordBatch
+        | pa.RecordBatchReader
+        | pd.DataFrame
         | None = None,
         *,
         computed: Dict[str, str] | None = None,
@@ -2443,7 +2459,10 @@ class Table(ABC):
             each row in the table, and can reference existing columns.
             Alternatively, a pyarrow Field or Schema can be provided to add
             new columns with the specified data types. The new columns will
-            be initialized with null values.
+            be initialized with null values. A pyarrow table, record batch,
+            record batch reader, or pandas or polars DataFrame supplies the
+            new column values directly, with one row for every existing row
+            in the table's scan order. Remote tables do not accept that form.
 
             A mapping with one ``FunctionApplication`` value keeps its scalar
             or named-struct result in the named table column. A bare
@@ -4650,6 +4669,10 @@ class LanceTable(Table):
         | pa.Field
         | List[pa.Field]
         | pa.Schema
+        | pa.Table
+        | pa.RecordBatch
+        | pa.RecordBatchReader
+        | pd.DataFrame
         | None = None,
         *,
         computed: Dict[str, str] | None = None,
@@ -6655,6 +6678,10 @@ class AsyncTable:
         | pa.Field
         | List[pa.Field]
         | pa.Schema
+        | pa.Table
+        | pa.RecordBatch
+        | pa.RecordBatchReader
+        | pd.DataFrame
         | None = None,
         *,
         computed: dict[str, str] | None = None,
@@ -6669,7 +6696,10 @@ class AsyncTable:
             value of the new column. These expressions will be evaluated for
             each row in the table, and can reference existing columns.
             Alternatively, you can pass a pyarrow field or schema to add
-            new columns with NULLs.
+            new columns with NULLs, or a pyarrow table, record batch, record
+            batch reader, or pandas or polars DataFrame with one value per
+            existing row in scan order. Remote tables do not accept column
+            values.
 
             A mapping with one ``FunctionApplication`` value keeps its scalar
             or named-struct result in the named table column. A bare
@@ -6743,6 +6773,10 @@ class AsyncTable:
             return await self._inner.add_computed_columns(list(computed.items()))
         if transforms is None:
             raise ValueError("add_columns requires transforms or computed columns")
+        if _is_add_columns_data(transforms):
+            return await self._inner.add_columns_from_reader(
+                _into_pyarrow_reader(transforms)
+            )
         if isinstance(transforms, pa.Schema):
             return await self._inner.add_columns_with_schema(transforms)
         else:

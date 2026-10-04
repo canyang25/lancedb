@@ -985,6 +985,10 @@ class RemoteTable(Table):
         | pa.Field
         | List[pa.Field]
         | pa.Schema
+        | pa.Table
+        | pa.RecordBatch
+        | pa.RecordBatchReader
+        | "pandas.DataFrame"  # noqa: F821
         | None = None,
         *,
         computed: Dict[str, str] | None = None,

@@ -4131,6 +4131,41 @@ def test_restore_consistency(tmp_path):
 
 
 # Schema evolution
+def test_add_columns_from_values(mem_db: DBConnection):
+    table = LanceTable.create(mem_db, "my_table", data=pa.table({"id": [1, 2, 3]}))
+    result = table.add_columns(pa.table({"label": ["a", "b", "c"]}))
+    assert result.version == 2
+    assert table.to_arrow().column("label").to_pylist() == ["a", "b", "c"]
+
+    reader_table = LanceTable.create(
+        mem_db, "from_reader", data=pa.table({"id": [1, 2]})
+    )
+    result = reader_table.add_columns(pa.table({"score": [10, 20]}).to_reader())
+    assert result.version == 2
+    assert reader_table.to_arrow().column("score").to_pylist() == [10, 20]
+
+    batch_table = LanceTable.create(mem_db, "from_batch", data=pa.table({"id": [1]}))
+    batch_table.add_columns(pa.record_batch([pa.array(["z"])], names=["label"]))
+    assert batch_table.to_arrow().column("label").to_pylist() == ["z"]
+
+    frame_table = LanceTable.create(mem_db, "from_frame", data=pa.table({"id": [1, 2]}))
+    frame_table.add_columns(pl.DataFrame({"label": ["x", "y"]}))
+    assert frame_table.to_arrow().column("label").to_pylist() == ["x", "y"]
+
+    if _PANDAS_AVAILABLE:
+        import pandas as pd
+
+        pandas_table = LanceTable.create(
+            mem_db, "from_pandas", data=pa.table({"id": [1, 2]})
+        )
+        pandas_table.add_columns(pd.DataFrame({"label": ["p", "q"]}))
+        assert pandas_table.to_arrow().column("label").to_pylist() == ["p", "q"]
+
+    short = LanceTable.create(mem_db, "short", data=pa.table({"id": [1, 2, 3]}))
+    with pytest.raises(ValueError, match="Stream ended before producing values"):
+        short.add_columns(pa.table({"label": ["only"]}))
+
+
 def test_add_columns(mem_db: DBConnection):
     data = pa.table({"id": [0, 1]})
     table = LanceTable.create(mem_db, "my_table", data=data)
