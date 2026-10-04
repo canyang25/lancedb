@@ -3070,3 +3070,179 @@ def test_view_crud_addresses_its_own_routes():
         ("GET", "/v1/namespace/analytics/view/list"),
         ("POST", "/v1/view/analytics$adults/drop"),
     ]
+
+
+def test_remote_table_accepts_table_call_style():
+    """Table-style calls bind on sync RemoteTable and reach the cloud request."""
+    import inspect
+
+    from lancedb.remote.table import RemoteTable
+    from lancedb.table import LanceTable, Table
+
+    def binds(method, *args, **kwargs):
+        inspect.signature(method).bind(None, *args, **kwargs)
+
+    shared = [
+        (delete, ("id = 1",), {"where": "id = 1"})
+        for delete in (Table.delete, RemoteTable.delete)
+    ]
+    shared += [
+        (drop, ("vector_idx",), {"name": "vector_idx"})
+        for drop in (Table.drop_index, RemoteTable.drop_index)
+    ]
+    shared += [
+        (stats, ("vector_idx",), {"index_name": "vector_idx"})
+        for stats in (Table.index_stats, RemoteTable.index_stats)
+    ]
+    for method, positional, keywords in shared:
+        binds(method, *positional)
+        binds(method, **keywords)
+    binds(RemoteTable.delete, predicate="id = 1")
+    binds(RemoteTable.drop_index, index_name="vector_idx")
+    binds(RemoteTable.index_stats, index_uuid="vector_idx")
+    for method in (Table.optimize, RemoteTable.optimize):
+        binds(method, retrain=True)
+    for method in (Table.cleanup_old_versions, RemoteTable.cleanup_old_versions):
+        binds(method, older_than=timedelta(days=1), delete_unverified=True)
+    for method in (Table.compact_files, RemoteTable.compact_files):
+        binds(method, target_rows_per_fragment=1000)
+    for method in (Table.search, RemoteTable.search):
+        binds(method, "quick", query_type="fts", ordering_field_name="id")
+    for method in (LanceTable.create_fts_index, RemoteTable.create_fts_index):
+        binds(method, "text", replace=True, tokenizer_name="en_stem")
+        binds(method, field_names="text", replace=True)
+    assert list(inspect.signature(LanceTable.create_index).parameters) == list(
+        inspect.signature(RemoteTable.create_index).parameters
+    )
+    bound = inspect.signature(RemoteTable.create_index).bind(None, "cosine", 2)
+    assert bound.arguments["num_partitions"] == 2
+
+    with pytest.warns(UserWarning, match="no-op"):
+        RemoteTable.cleanup_old_versions(
+            object(), older_than=timedelta(days=1), delete_unverified=True
+        )
+        RemoteTable.compact_files(object(), target_rows_per_fragment=1000)
+        RemoteTable.optimize(object(), retrain=True)
+    with pytest.warns(DeprecationWarning, match="ordering_field_name"):
+        RemoteTable.search(
+            object(), "quick", query_type="fts", ordering_field_name="id"
+        )
+    with pytest.warns(DeprecationWarning, match="create_index"):
+        with pytest.raises(ValueError, match="IVF_HNSW_PQ"):
+            RemoteTable.__new__(RemoteTable).create_index(index_type="IVF_HNSW_PQ")
+
+    describe = json.dumps(
+        {
+            "version": 1,
+            "schema": {
+                "fields": [
+                    {"name": "id", "type": {"type": "int64"}, "nullable": False},
+                    {"name": "text", "type": {"type": "string"}, "nullable": False},
+                    {
+                        "name": "vector",
+                        "type": {
+                            "type": "fixed_size_list",
+                            "fields": [
+                                {
+                                    "name": "item",
+                                    "type": {"type": "float"},
+                                    "nullable": True,
+                                }
+                            ],
+                            "length": 2,
+                        },
+                        "nullable": False,
+                    },
+                ]
+            },
+        }
+    )
+    bodies = {}
+
+    def handler(request):
+        content_len = int(request.headers.get("Content-Length", 0))
+        raw = request.rfile.read(content_len) if content_len else b""
+        parsed = json.loads(raw) if raw else {}
+        payload = {
+            "/v1/table/test/create/?mode=create": b"{}",
+            "/v1/table/test/describe/": describe.encode(),
+            "/v1/table/test/delete/": b'{"num_deleted_rows": 1, "version": 2}',
+            "/v1/table/test/create_index/": b"",
+            "/v1/table/test/index/vector_idx/drop/": b"",
+            "/v1/table/test/index/vector_idx/stats/": (
+                b'{"num_indexed_rows":1,"num_unindexed_rows":0,'
+                b'"index_type":"IVF_PQ","distance_type":"l2"}'
+            ),
+        }.get(request.path)
+        if payload is None:
+            request.send_response(404)
+            request.end_headers()
+            request.wfile.write(request.path.encode())
+            return
+        if request.path.endswith("/delete/"):
+            bodies.setdefault("delete", []).append(parsed)
+        elif request.path.endswith("/create_index/"):
+            bodies.setdefault("create_index", []).append(parsed)
+        elif request.path.endswith("/drop/"):
+            bodies.setdefault("drop", []).append(request.path)
+        request.send_response(200)
+        if payload:
+            request.send_header("Content-Type", "application/json")
+        request.end_headers()
+        request.wfile.write(payload)
+
+    with mock_lancedb_connection(handler) as db:
+        table = db.create_table("test", [{"id": 1}])
+        table.delete(where="id = 1")
+        table.delete("id = 1")
+        with pytest.warns(DeprecationWarning, match="predicate"):
+            table.delete(predicate="id = 1")
+        with pytest.warns(DeprecationWarning, match="create_index"):
+            table.create_index("cosine", 2)
+            table.create_index(
+                index_type="IVF_HNSW_SQ", num_partitions=1, m=10, ef_construction=50
+            )
+        with pytest.warns(DeprecationWarning, match="create_fts_index"):
+            table.create_fts_index(
+                field_names="text", replace=True, tokenizer_name="en_stem"
+            )
+            with pytest.warns(DeprecationWarning, match="'column'"):
+                table.create_fts_index(column="text")
+        with pytest.warns(DeprecationWarning, match="index_name"):
+            table.drop_index(index_name="vector_idx")
+        table.drop_index(name="vector_idx")
+        stats = table.index_stats(index_name="vector_idx")
+        with pytest.warns(DeprecationWarning, match="index_uuid"):
+            alias_stats = table.index_stats(index_uuid="vector_idx")
+
+    assert [body["predicate"].replace(" ", "") for body in bodies["delete"]] == [
+        "id=1",
+        "id=1",
+        "id=1",
+    ]
+    cosine, hnsw, stemmed, plain = bodies["create_index"]
+    assert (
+        cosine["column"],
+        cosine["index_type"],
+        cosine["metric_type"],
+        cosine["num_partitions"],
+    ) == ("vector", "IVF_PQ", "cosine", 2)
+    assert (
+        hnsw["index_type"],
+        hnsw["num_partitions"],
+        hnsw["m"],
+        hnsw["ef_construction"],
+    ) == ("IVF_HNSW_SQ", 1, 10, 50)
+    assert stemmed["column"] == "text"
+    assert stemmed["language"] == "English"
+    assert stemmed["stem"] is True
+    assert stemmed["remove_stop_words"] is False
+    assert "replace" not in stemmed
+    assert (plain["column"], plain["stem"], plain["remove_stop_words"]) == (
+        "text",
+        True,
+        True,
+    )
+    assert len(bodies["drop"]) == 2
+    assert stats["num_indexed_rows"] == alias_stats["num_indexed_rows"] == 1
+    assert stats["index_type"] == alias_stats["index_type"] == "IVF_PQ"
