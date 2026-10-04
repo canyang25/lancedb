@@ -306,8 +306,8 @@ pub async fn create_plan(
     // Adding Scanner's global limit would truncate the combined result to k rows.
     if !is_batch_query {
         scanner.limit(
-            query.base.limit.map(|limit| limit as i64),
-            query.base.offset.map(|offset| offset as i64),
+            query.base.limit.map(crate::query::usize_to_i64),
+            query.base.offset.map(crate::query::usize_to_i64),
         )?;
     }
 
@@ -1022,6 +1022,36 @@ mod tests {
         let batches = stream.try_collect::<Vec<_>>().await.unwrap();
         let count: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(count, 2); // 4 and 5
+    }
+
+    /// `limit(usize::MAX)` is the Rust spelling of "return every row". Casting it
+    /// to `i64` used to wrap to -1 and the scanner rejected the query.
+    #[tokio::test]
+    async fn test_limit_usize_max_returns_every_row() {
+        use crate::connect;
+        use arrow_schema::{DataType, Field, Schema};
+
+        let conn = connect("memory://").execute().await.unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+        let table = conn
+            .create_table("limit_usize_max", vec![batch])
+            .execute()
+            .await
+            .unwrap();
+
+        let batches = table
+            .query()
+            .limit(usize::MAX)
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let count: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(count, 3);
     }
 
     #[tokio::test]

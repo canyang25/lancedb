@@ -366,9 +366,9 @@ fn selected_columns(query: &VectorQueryRequest) -> Option<Vec<String>> {
 }
 
 /// Non-negative `Option<usize>` limit/offset as the `Option<i64>` the scanner
-/// expects.
+/// expects. Values above `i64::MAX` are clamped so `usize::MAX` stays non-negative.
 fn as_i64(value: Option<usize>) -> Option<i64> {
-    value.map(|v| v as i64)
+    value.map(crate::query::usize_to_i64)
 }
 
 /// Build a base `LsmScanner` configured with sources, filter, and projection.

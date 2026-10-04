@@ -52,6 +52,15 @@ pub(crate) mod wal_fusion; // WAL-PK-FUSION: delete with the module.
 
 pub(crate) const DEFAULT_TOP_K: usize = 10;
 
+/// Convert a query limit or offset to the non-negative `i64` Lance's scanner accepts.
+///
+/// Values above [`i64::MAX`], including [`usize::MAX`] used as "return everything",
+/// do not fit. Casting them with `as i64` wraps to a negative number and the scanner
+/// rejects the query (`Limit must be non-negative`). Clamp to [`i64::MAX`] instead.
+pub(crate) fn usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// Which columns should be retrieved from the database
 #[derive(Debug, Clone)]
 pub enum Select {

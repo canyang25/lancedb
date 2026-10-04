@@ -21,7 +21,7 @@ use crate::materialized_view::{
     MaterializedViewDefinition, MaterializedViewInfo, RefreshMaterializedViewResult, ViewProjection,
 };
 use crate::query::wal_fusion::PkFusionMemory; // WAL-PK-FUSION: delete.
-use crate::query::{QueryFilter, QueryRequest, Select, VectorQueryRequest};
+use crate::query::{QueryFilter, QueryRequest, Select, VectorQueryRequest, usize_to_i64};
 use crate::remote::job::RemoteJob;
 use crate::table::AddColumnsResult;
 use crate::table::AddResult;
@@ -1020,13 +1020,14 @@ impl<S: HttpSend> RemoteTable<S> {
             body["use_lsm"] = serde_json::Value::Bool(use_lsm);
         }
         if let Some(offset) = params.offset {
-            body["offset"] = serde_json::Value::Number(serde_json::Number::from(offset));
+            body["offset"] = serde_json::Value::Number(Number::from(usize_to_i64(offset)));
         }
 
-        // Server requires k.
-        // use isize::MAX as usize to avoid overflow: https://github.com/lancedb/lancedb/issues/2211
-        let limit = params.limit.unwrap_or(isize::MAX as usize);
-        body["k"] = serde_json::Value::Number(serde_json::Number::from(limit));
+        // Server requires k. `usize::MAX` does not fit in the i64 the server
+        // accepts; clamp it the same way the local scanner does.
+        // https://github.com/lancedb/lancedb/issues/2211
+        let limit = usize_to_i64(params.limit.unwrap_or(isize::MAX as usize));
+        body["k"] = serde_json::Value::Number(Number::from(limit));
 
         if let Some(filter) = &params.filter {
             let filter_sql = match filter {
@@ -5189,6 +5190,42 @@ mod tests {
             .await;
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].as_ref().unwrap(), &expected_data);
+    }
+
+    /// An explicit `usize::MAX` limit/offset must be sent as `i64::MAX`, not a
+    /// wrapped negative or a `u64` the server cannot parse as `i64`.
+    #[tokio::test]
+    async fn test_query_usize_max_limit_is_clamped() {
+        let table = Table::new_with_handler("my_table", |request| {
+            let body = request.body().unwrap().as_bytes().unwrap();
+            let body: serde_json::Value = serde_json::from_slice(body).unwrap();
+            assert_eq!(body["k"], serde_json::json!(i64::MAX));
+            assert_eq!(body["offset"], serde_json::json!(i64::MAX));
+
+            let data = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+                vec![Arc::new(Int32Array::from(vec![1]))],
+            )
+            .unwrap();
+            http::Response::builder()
+                .status(200)
+                .header(CONTENT_TYPE, ARROW_FILE_CONTENT_TYPE)
+                .body(write_ipc_file(&data))
+                .unwrap()
+        });
+
+        let query = AnyQuery::Query(QueryRequest {
+            limit: Some(usize::MAX),
+            offset: Some(usize::MAX),
+            ..Default::default()
+        });
+        table
+            .base_table()
+            .query(&query, Default::default())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
     }
 
     fn blob_describe_response() -> http::Response<String> {
