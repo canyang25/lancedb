@@ -5192,15 +5192,17 @@ mod tests {
         assert_eq!(data[0].as_ref().unwrap(), &expected_data);
     }
 
-    /// An explicit `usize::MAX` limit/offset must be sent as `i64::MAX`, not a
-    /// wrapped negative or a `u64` the server cannot parse as `i64`.
+    /// An explicit `usize::MAX` limit/offset must be sent as the non-negative
+    /// `i64` from [`usize_to_i64`]. On 32-bit that is `usize::MAX` itself; on
+    /// 64-bit it is `i64::MAX`. Either way it must not wrap negative.
     #[tokio::test]
     async fn test_query_usize_max_limit_is_clamped() {
         let table = Table::new_with_handler("my_table", |request| {
             let body = request.body().unwrap().as_bytes().unwrap();
             let body: serde_json::Value = serde_json::from_slice(body).unwrap();
-            assert_eq!(body["k"], serde_json::json!(i64::MAX));
-            assert_eq!(body["offset"], serde_json::json!(i64::MAX));
+            let expected = serde_json::json!(usize_to_i64(usize::MAX));
+            assert_eq!(body["k"], expected);
+            assert_eq!(body["offset"], expected);
 
             let data = RecordBatch::try_new(
                 Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),

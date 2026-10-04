@@ -556,6 +556,12 @@ async fn execute_namespace_query(
     parse_arrow_ipc_response(response_bytes).await
 }
 
+/// Namespace `k` and `offset` are `i32`. Values above [`i32::MAX`], including
+/// [`usize::MAX`], wrap to a negative number with `as i32`.
+fn usize_to_i32(value: usize) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
 /// Convert an AnyQuery to the namespace QueryTableRequest format.
 fn convert_to_namespace_query(query: &AnyQuery) -> Result<NsQueryTableRequest> {
     query.base().check_filter()?;
@@ -623,12 +629,12 @@ fn convert_to_namespace_query(query: &AnyQuery) -> Result<NsQueryTableRequest> {
 
             Ok(NsQueryTableRequest {
                 id: None, // Will be set in namespace_query
-                k: vq.base.limit.unwrap_or(10) as i32,
+                k: usize_to_i32(vq.base.limit.unwrap_or(10)),
                 vector: Box::new(vector),
                 vector_column: vq.column.clone(),
                 filter,
                 columns,
-                offset: vq.base.offset.map(|o| o as i32),
+                offset: vq.base.offset.map(usize_to_i32),
                 distance_type: vq.distance_type.map(|dt| dt.to_string()),
                 nprobes: Some(vq.minimum_nprobes as i32),
                 ef: vq.ef.map(|e| e as i32),
@@ -704,11 +710,11 @@ fn convert_to_namespace_query(query: &AnyQuery) -> Result<NsQueryTableRequest> {
             Ok(NsQueryTableRequest {
                 id: None, // Will be set by caller
                 vector,
-                k: q.limit.unwrap_or(10) as i32,
+                k: usize_to_i32(q.limit.unwrap_or(10)),
                 filter,
                 columns,
                 prefilter: Some(q.prefilter),
-                offset: q.offset.map(|o| o as i32),
+                offset: q.offset.map(usize_to_i32),
                 vector_column: None, // No vector column for plain queries
                 with_row_id: Some(q.with_row_id),
                 bypass_vector_index: Some(true), // No vector index for plain queries
@@ -979,6 +985,43 @@ mod tests {
         assert!(ns_request.vector_column.is_none());
 
         assert!(ns_request.vector.single_vector.as_ref().unwrap().is_empty());
+    }
+
+    /// `usize::MAX` does not fit in the namespace `i32` fields. Both arms must
+    /// clamp it, and a missing limit must stay the default of 10.
+    #[test]
+    fn test_convert_to_namespace_query_usize_max_limit_is_clamped() {
+        let expected = i32::try_from(usize::MAX).unwrap_or(i32::MAX);
+        let query_vector = Arc::new(Float32Array::from(vec![1.0, 2.0])) as Arc<dyn Array>;
+
+        let vector = AnyQuery::VectorQuery(VectorQueryRequest {
+            base: QueryRequest {
+                limit: Some(usize::MAX),
+                offset: Some(usize::MAX),
+                ..Default::default()
+            },
+            query_vector: vec![query_vector],
+            ..Default::default()
+        });
+        let vector_request = convert_to_namespace_query(&vector).unwrap();
+        assert_eq!(vector_request.k, expected);
+        assert_eq!(vector_request.offset, Some(expected));
+
+        let plain = AnyQuery::Query(QueryRequest {
+            limit: Some(usize::MAX),
+            offset: Some(usize::MAX),
+            ..Default::default()
+        });
+        let plain_request = convert_to_namespace_query(&plain).unwrap();
+        assert_eq!(plain_request.k, expected);
+        assert_eq!(plain_request.offset, Some(expected));
+
+        let default_limit = AnyQuery::Query(QueryRequest::default());
+        assert_eq!(convert_to_namespace_query(&default_limit).unwrap().k, 10);
+        assert_eq!(
+            convert_to_namespace_query(&default_limit).unwrap().offset,
+            None
+        );
     }
 
     #[tokio::test]
