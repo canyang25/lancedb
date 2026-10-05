@@ -61,7 +61,6 @@ futures = "0.3"
 log = "0.4"
 metrics = "0.24"
 metrics-util = "0.19"
-moka = { version = "0.12", features = ["future"] }
 object_store = "0.14.1"
 pin-project = "1.0.7"
 rand = "0.9"

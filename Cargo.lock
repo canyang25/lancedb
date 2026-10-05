@@ -5823,7 +5823,6 @@ dependencies = [
  "log",
  "metrics",
  "metrics-util",
- "moka",
  "num-traits",
  "oauth2",
  "object_store 0.14.2",

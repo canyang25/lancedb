@@ -51,7 +51,6 @@ lance-namespace = { workspace = true }
 lance-namespace-impls = { workspace = true }
 metrics = { workspace = true, optional = true }
 metrics-util = { workspace = true, optional = true }
-moka = { workspace = true }
 pin-project = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net", "time"] }
 log.workspace = true

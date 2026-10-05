@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use http::StatusCode;
 use lance_io::object_store::StorageOptions;
 use lance_namespace_impls::{DynamicContextProvider, OperationInfo};
-use moka::future::Cache;
 use reqwest::Response;
 use reqwest::header::CONTENT_TYPE;
 
@@ -220,8 +219,6 @@ impl RemoteDatabaseOptionsBuilder {
 #[derive(Debug)]
 pub struct RemoteDatabase<S: HttpSend = Sender> {
     client: RestfulLanceDbClient<S>,
-    // Cache existence and server capabilities, not mutable per-handle table state.
-    table_cache: Cache<String, ServerVersion>,
     uri: String,
     /// Headers to pass to the namespace client for authentication
     namespace_headers: HashMap<String, String>,
@@ -408,14 +405,8 @@ impl RemoteDatabase {
             read_consistency_interval,
         )?;
 
-        let table_cache = Cache::builder()
-            .time_to_live(std::time::Duration::from_secs(300))
-            .max_capacity(10_000)
-            .build();
-
         Ok(Self {
             client,
-            table_cache,
             uri: uri.to_owned(),
             namespace_headers,
             namespace_context_provider,
@@ -450,11 +441,9 @@ impl<S: HttpSend> RemoteDatabase<S> {
         namespace_path: &[String],
     ) -> Result<(String, Response)> {
         let identifier = build_table_identifier(name, namespace_path)?;
-        let cache_key = build_cache_key(name, namespace_path);
         let req = self.client.post(&format!("/v1/table/{}/drop/", identifier));
         let (request_id, resp) = self.client.send(req).await?;
         let resp = self.client.check_response(&request_id, resp).await?;
-        self.table_cache.remove(&cache_key).await;
         Ok((request_id, resp))
     }
 
@@ -469,16 +458,11 @@ impl<S: HttpSend> RemoteDatabase<S> {
     ///
     /// This is the cost `table_names` already paid -- the server used to enumerate and sort the
     /// namespace on every request -- and it is why `list_tables` replaces it.
-    async fn table_names_in_namespace(
-        &self,
-        request: &TableNamesRequest,
-    ) -> Result<(Vec<String>, ServerVersion)> {
+    async fn table_names_in_namespace(&self, request: &TableNamesRequest) -> Result<Vec<String>> {
         let namespace_id = build_namespace_identifier(&request.namespace_path)?;
         let path = format!("/v1/namespace/{}/table/list", namespace_id);
 
         let mut names = Vec::new();
-        // Every page reports the same server, so keep the first page's version.
-        let mut version: Option<ServerVersion> = None;
         let mut page_token: Option<String> = None;
         loop {
             let mut req = self.client.get(&path);
@@ -487,9 +471,6 @@ impl<S: HttpSend> RemoteDatabase<S> {
             }
             let (request_id, rsp) = self.client.send_with_retry(req, None, true).await?;
             let rsp = self.client.check_response(&request_id, rsp).await?;
-            if version.is_none() {
-                version = Some(parse_server_version(&request_id, &rsp)?);
-            }
             let response: ListTablesResponse = rsp.json().await.err_to_http(request_id)?;
             names.extend(response.tables);
             // An empty token is the end of the listing, not a token to send back: a server
@@ -510,7 +491,7 @@ impl<S: HttpSend> RemoteDatabase<S> {
         if let Some(limit) = request.limit {
             names.truncate(limit as usize);
         }
-        Ok((names, version.unwrap_or_default()))
+        Ok(names)
     }
 }
 
@@ -530,7 +511,6 @@ mod test_utils {
             let client = client_with_handler(handler);
             Self {
                 client,
-                table_cache: Cache::new(0),
                 uri: "http://localhost".to_string(),
                 namespace_headers: HashMap::new(),
                 namespace_context_provider: None,
@@ -553,7 +533,6 @@ mod test_utils {
                 });
             Self {
                 client,
-                table_cache: Cache::new(0),
                 uri: "http://localhost".to_string(),
                 namespace_headers: config.extra_headers.clone(),
                 namespace_context_provider,
@@ -667,29 +646,6 @@ fn build_namespace_identifier(namespace: &[String]) -> Result<String> {
         return Ok(ID_DELIMITER.to_string());
     }
     Ok(join_identifier(namespace.iter().map(String::as_str)))
-}
-
-/// Build a secure cache key using length prefixes.
-/// This format is completely unambiguous regardless of delimiter or content.
-/// Format: [u32_len][namespace1][u32_len][namespace2]...[u32_len][table_name]
-/// Returns a hex-encoded string for use as a cache key.
-fn build_cache_key(name: &str, namespace: &[String]) -> String {
-    let mut key = Vec::new();
-
-    // Add each namespace component with length prefix
-    for ns in namespace {
-        let bytes = ns.as_bytes();
-        key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        key.extend_from_slice(bytes);
-    }
-
-    // Add table name with length prefix
-    let name_bytes = name.as_bytes();
-    key.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-    key.extend_from_slice(name_bytes);
-
-    // Convert to hex string for use as a cache key
-    key.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 #[derive(serde::Deserialize)]
@@ -913,9 +869,6 @@ impl<S: HttpSend> Database for RemoteDatabase<S> {
                 });
             }
         };
-        self.table_cache
-            .remove(&build_cache_key(name, namespace_path))
-            .await;
         Ok(job)
     }
 
@@ -1413,7 +1366,7 @@ impl<S: HttpSend> Database for RemoteDatabase<S> {
     }
 
     async fn table_names(&self, request: TableNamesRequest) -> Result<Vec<String>> {
-        let (tables, version) = if request.namespace_path.is_empty() {
+        if request.namespace_path.is_empty() {
             // The flat route resumes after a table name and orders by name, which is exactly
             // what `start_after` means, so the server does the paging.
             let mut req = self.client.get("/v1/table/");
@@ -1425,23 +1378,15 @@ impl<S: HttpSend> Database for RemoteDatabase<S> {
             }
             let (request_id, rsp) = self.client.send_with_retry(req, None, true).await?;
             let rsp = self.client.check_response(&request_id, rsp).await?;
-            let version = parse_server_version(&request_id, &rsp)?;
             let tables = rsp
                 .json::<ListTablesResponse>()
                 .await
                 .err_to_http(request_id)?
                 .tables;
-            (tables, version)
+            Ok(tables)
         } else {
-            self.table_names_in_namespace(&request).await?
-        };
-
-        for table in &tables {
-            build_table_identifier(table, &request.namespace_path)?;
-            let cache_key = build_cache_key(table, &request.namespace_path);
-            self.table_cache.insert(cache_key, version.clone()).await;
+            self.table_names_in_namespace(&request).await
         }
-        Ok(tables)
     }
 
     async fn list_tables(&self, request: ListTablesRequest) -> Result<ListTablesResponse> {
@@ -1460,17 +1405,7 @@ impl<S: HttpSend> Database for RemoteDatabase<S> {
 
         let (request_id, rsp) = self.client.send_with_retry(req, None, true).await?;
         let rsp = self.client.check_response(&request_id, rsp).await?;
-        let version = parse_server_version(&request_id, &rsp)?;
         let response: ListTablesResponse = rsp.json().await.err_to_http(request_id)?;
-
-        // Cache the tables for future use
-        let namespace_vec = namespace_parts.to_vec();
-        for table in &response.tables {
-            build_table_identifier(table, &namespace_vec)?;
-            let cache_key = build_cache_key(table, &namespace_vec);
-            self.table_cache.insert(cache_key, version.clone()).await;
-        }
-
         Ok(response)
     }
 
@@ -1541,16 +1476,14 @@ impl<S: HttpSend> Database for RemoteDatabase<S> {
         let rsp = self.client.check_response(&request_id, rsp).await?;
         let version = parse_server_version(&request_id, &rsp)?;
         let table_identifier = build_table_identifier(&request.name, &request.namespace_path)?;
-        let cache_key = build_cache_key(&request.name, &request.namespace_path);
         let table = Arc::new(RemoteTable::new_with_sql_client(
             self.client.clone(),
             request.name.clone(),
             request.namespace_path.clone(),
             table_identifier,
-            version.clone(),
+            version,
             self.sql_client.clone(),
         ));
-        self.table_cache.insert(cache_key, version).await;
 
         Ok(table)
     }
@@ -1584,62 +1517,55 @@ impl<S: HttpSend> Database for RemoteDatabase<S> {
         }
 
         let version = parse_server_version(&request_id, &rsp)?;
-        let cache_key = build_cache_key(&request.target_table_name, &request.target_namespace_path);
         let table = Arc::new(RemoteTable::new_with_sql_client(
             self.client.clone(),
             request.target_table_name.clone(),
             request.target_namespace_path.clone(),
             table_identifier,
-            version.clone(),
+            version,
             self.sql_client.clone(),
         ));
-        self.table_cache.insert(cache_key, version).await;
 
         Ok(table)
     }
 
     async fn open_table(&self, request: OpenTableRequest) -> Result<Arc<dyn BaseTable>> {
         let identifier = build_table_identifier(&request.name, &request.namespace_path)?;
-        let cache_key = build_cache_key(&request.name, &request.namespace_path);
 
-        // Every open gets its own checkout, schema cache, and freshness state.
-        if let Some(version) = self.table_cache.get(&cache_key).await {
-            Ok(Arc::new(RemoteTable::new_with_sql_client(
-                self.client.clone(),
-                request.name,
-                request.namespace_path,
-                identifier,
-                version,
-                self.sql_client.clone(),
-            )))
-        } else {
-            // Describe the table to confirm it exists before moving on.
-            let req = self
-                .client
-                .post(&format!("/v1/table/{}/describe/", identifier));
-            let (request_id, rsp) = self.client.send_with_retry(req, None, true).await?;
-            let rsp =
-                RemoteTable::<S>::handle_table_not_found(&request.name, rsp, &request_id).await?;
-            let rsp = self.client.check_response(&request_id, rsp).await?;
-            let version = parse_server_version(&request_id, &rsp)?;
-            let describe_body = rsp.text().await.ok();
-            let table = Arc::new(RemoteTable::new_with_sql_client(
-                self.client.clone(),
-                request.name.clone(),
-                request.namespace_path.clone(),
-                identifier,
-                version.clone(),
-                self.sql_client.clone(),
-            ));
-            // This describe already carries the schema, so hand it to the table
-            // instead of making the first schema read fetch it again. A version or
-            // branch pin applied after this invalidates the cache.
-            if let Some(body) = &describe_body {
-                table.seed_schema(body);
-            }
-            self.table_cache.insert(cache_key, version).await;
-            Ok(table)
+        // Every open gets its own handle, schema cache, and freshness state.
+        // Describe on every open. A name this client has already listed or
+        // created is not proof the table still exists: another client can drop
+        // it. The response also seeds the schema cache when it carries one.
+        //
+        // The body matches the other describe calls (`{"version": null}` for
+        // latest). A body-less POST is rejected by the namespace REST adapter
+        // (415: it requires `Content-Type: application/json`). Leaving
+        // `load_detailed_metadata` unset keeps that adapter on the cheap
+        // metadata check; LanceDB Cloud still returns the schema.
+        let req = self
+            .client
+            .post(&format!("/v1/table/{}/describe/", identifier))
+            .json(&serde_json::json!({ "version": null }));
+        let (request_id, rsp) = self.client.send_with_retry(req, None, true).await?;
+        let rsp = RemoteTable::<S>::handle_table_not_found(&request.name, rsp, &request_id).await?;
+        let rsp = self.client.check_response(&request_id, rsp).await?;
+        let version = parse_server_version(&request_id, &rsp)?;
+        let describe_body = rsp.text().await.ok();
+        let table = Arc::new(RemoteTable::new_with_sql_client(
+            self.client.clone(),
+            request.name.clone(),
+            request.namespace_path.clone(),
+            identifier,
+            version,
+            self.sql_client.clone(),
+        ));
+        // Seed when the body carries a schema. A namespace describe that omits
+        // one leaves the cache empty, and the next schema read fetches it.
+        // A version or branch pin applied after this drops the seeded schema.
+        if let Some(body) = &describe_body {
+            table.seed_schema(body);
         }
+        Ok(table)
     }
 
     async fn rename_table(
@@ -1650,8 +1576,6 @@ impl<S: HttpSend> Database for RemoteDatabase<S> {
         new_namespace_path: &[String],
     ) -> Result<()> {
         let current_identifier = build_table_identifier(current_name, cur_namespace_path)?;
-        let current_cache_key = build_cache_key(current_name, cur_namespace_path);
-        let new_cache_key = build_cache_key(new_name, new_namespace_path);
 
         let mut body = serde_json::json!({ "new_table_name": new_name });
         if !new_namespace_path.is_empty() {
@@ -1668,10 +1592,6 @@ impl<S: HttpSend> Database for RemoteDatabase<S> {
             .json(&body);
         let (request_id, resp) = self.client.send(req).await?;
         self.client.check_response(&request_id, resp).await?;
-        let table = self.table_cache.remove(&current_cache_key).await;
-        if let Some(table) = table {
-            self.table_cache.insert(new_cache_key, table).await;
-        }
         Ok(())
     }
 
@@ -1904,7 +1824,7 @@ impl From<StorageOptions> for RemoteOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{NamespaceHeaderProviderContext, build_cache_key};
+    use super::NamespaceHeaderProviderContext;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, OnceLock};
@@ -1923,38 +1843,6 @@ mod tests {
         job::JobEventsRequest,
         remote::{ARROW_STREAM_CONTENT_TYPE, ClientConfig, HeaderProvider, JSON_CONTENT_TYPE},
     };
-
-    #[test]
-    fn test_cache_key_security() {
-        // Test that cache keys are unique regardless of delimiter manipulation
-
-        // Case 1: Different delimiters should not affect cache key
-        let key1 = build_cache_key("table1", &["ns1".to_string(), "ns2".to_string()]);
-        let key2 = build_cache_key("table1", &["ns1$ns2".to_string()]);
-        assert_ne!(
-            key1, key2,
-            "Cache keys should differ for different namespace structures"
-        );
-
-        // Case 2: Table name containing delimiter should not cause collision
-        let key3 = build_cache_key("ns2$table1", &["ns1".to_string()]);
-        assert_ne!(
-            key1, key3,
-            "Cache key should be different when table name contains delimiter"
-        );
-
-        // Case 3: Empty namespace vs namespace with empty string
-        let key4 = build_cache_key("table1", &[]);
-        let key5 = build_cache_key("table1", &["".to_string()]);
-        assert_ne!(
-            key4, key5,
-            "Empty namespace should differ from namespace with empty string"
-        );
-
-        // Case 4: Verify same inputs produce same key (consistency)
-        let key6 = build_cache_key("table1", &["ns1".to_string(), "ns2".to_string()]);
-        assert_eq!(key1, key6, "Same inputs should produce same cache key");
-    }
 
     #[tokio::test]
     async fn test_create_materialized_view_requires_sql_client() {
@@ -2311,6 +2199,13 @@ mod tests {
             assert_eq!(request.method(), &reqwest::Method::POST);
             assert_eq!(request.url().path(), "/v1/table/table1/describe/");
             assert_eq!(request.url().query(), None);
+            assert_eq!(
+                request
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json")
+            );
 
             http::Response::builder()
                 .status(200)
@@ -2334,7 +2229,7 @@ mod tests {
     async fn test_open_table_checkout_is_independent_per_handle() {
         let latest = Arc::new(AtomicUsize::new(2));
         let current = latest.clone();
-        let mut db = super::RemoteDatabase::new_mock(move |request| {
+        let db = super::RemoteDatabase::new_mock(move |request| {
             let body = match request.url().path() {
                 "/v1/table/table1/describe/" => {
                     let requested_version = request
@@ -2360,7 +2255,6 @@ mod tests {
             };
             http::Response::builder().status(200).body(body).unwrap()
         });
-        db.table_cache = moka::future::Cache::new(10);
         let conn = Connection::new(
             Arc::new(db),
             Arc::new(crate::embeddings::MemoryRegistry::new()),
@@ -2476,6 +2370,138 @@ mod tests {
         assert!(matches!(result, Err(crate::Error::TableNotFound { .. })));
     }
 
+    /// Listing a name does not prove the table still exists. A table another
+    /// client has since dropped must fail `open_table`, and a name that is
+    /// still present must be opened from a fresh describe.
+    #[tokio::test]
+    async fn test_open_table_checks_existence_when_the_name_is_cached() {
+        let describes = Arc::new(AtomicUsize::new(0));
+        let describes_for_handler = describes.clone();
+        let db = super::RemoteDatabase::new_mock(move |request| match request.url().path() {
+            "/v1/table/" => http::Response::builder()
+                .status(200)
+                .body(r#"{"tables": ["gone", "still_here"]}"#.to_string())
+                .unwrap(),
+            "/v1/table/gone/describe/" | "/v1/table/still_here/describe/" => {
+                assert_eq!(
+                    request
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("application/json")
+                );
+                let body = request
+                    .body()
+                    .and_then(|body| body.as_bytes())
+                    .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok());
+                assert_eq!(
+                    body.as_ref().and_then(|body| body.get("version")),
+                    Some(&serde_json::Value::Null)
+                );
+                if request.url().path().ends_with("/gone/describe/") {
+                    http::Response::builder()
+                        .status(404)
+                        .body("table not found".to_string())
+                        .unwrap()
+                } else {
+                    describes_for_handler.fetch_add(1, Ordering::SeqCst);
+                    http::Response::builder()
+                        .status(200)
+                        .body(
+                            r#"{"version": 4, "schema": {"fields": [
+                                {"name": "id", "type": {"type": "int64"}, "nullable": false}
+                            ]}}"#
+                                .to_string(),
+                        )
+                        .unwrap()
+                }
+            }
+            path => panic!("unexpected path {path}"),
+        });
+        let conn = Connection::new(
+            Arc::new(db),
+            Arc::new(crate::embeddings::MemoryRegistry::new()),
+        );
+
+        let names = conn.table_names().execute().await.unwrap();
+        assert_eq!(names, vec!["gone", "still_here"]);
+
+        let missing = conn.open_table("gone").execute().await.unwrap_err();
+        assert!(
+            matches!(missing, Error::TableNotFound { ref name, .. } if name == "gone"),
+            "{missing:?}"
+        );
+
+        let table = conn.open_table("still_here").execute().await.unwrap();
+        assert_eq!(table.name(), "still_here");
+        // The open describe seeded the schema, so reading it stays on that one call.
+        assert_eq!(table.schema().await.unwrap().field(0).name(), "id");
+        assert_eq!(describes.load(Ordering::SeqCst), 1);
+
+        // Every open describes, including a second open of the same name.
+        let again = conn.open_table("still_here").execute().await.unwrap();
+        assert_eq!(again.schema().await.unwrap().field(0).name(), "id");
+        assert_eq!(describes.load(Ordering::SeqCst), 2);
+    }
+
+    /// A namespace listing does not prove the table still exists. The describe
+    /// has to address `namespace$table`, and a dropped name still comes back
+    /// as TableNotFound.
+    #[tokio::test]
+    async fn test_open_table_checks_a_cached_name_in_a_namespace() {
+        let db = super::RemoteDatabase::new_mock(|request| match request.url().path() {
+            "/v1/namespace/ns/table/list" => http::Response::builder()
+                .status(200)
+                .body(r#"{"tables": ["gone"]}"#.to_string())
+                .unwrap(),
+            "/v1/table/ns$gone/describe/" => {
+                assert_eq!(
+                    request
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("application/json")
+                );
+                let body = request
+                    .body()
+                    .and_then(|body| body.as_bytes())
+                    .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok());
+                assert_eq!(
+                    body.as_ref().and_then(|body| body.get("version")),
+                    Some(&serde_json::Value::Null)
+                );
+                http::Response::builder()
+                    .status(404)
+                    .body("table not found".to_string())
+                    .unwrap()
+            }
+            path => panic!("unexpected path {path}"),
+        });
+        let conn = Connection::new(
+            Arc::new(db),
+            Arc::new(crate::embeddings::MemoryRegistry::new()),
+        );
+
+        let names = conn
+            .table_names()
+            .namespace(vec!["ns".to_string()])
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(names, vec!["gone"]);
+
+        let missing = conn
+            .open_table("gone")
+            .namespace(vec!["ns".to_string()])
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(missing, Error::TableNotFound { ref name, .. } if name == "gone"),
+            "{missing:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_create_table() {
         let conn = Connection::new_with_handler(|request| {
@@ -2538,7 +2564,7 @@ mod tests {
             "schema": lance::arrow::json::JsonSchema::try_from(&existing_schema).unwrap(),
         })
         .to_string();
-        let mut db = super::RemoteDatabase::new_mock(move |request| {
+        let db = super::RemoteDatabase::new_mock(move |request| {
             assert_eq!(request.method(), &reqwest::Method::POST);
             match request.url().path() {
                 "/v1/table/table1/create/" => {
@@ -2555,7 +2581,6 @@ mod tests {
                 path => panic!("unexpected path: {path}"),
             }
         });
-        db.table_cache = moka::future::Cache::new(10);
         let conn = Connection::new(
             Arc::new(db),
             Arc::new(crate::embeddings::MemoryRegistry::new()),
