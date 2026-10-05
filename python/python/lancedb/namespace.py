@@ -727,10 +727,19 @@ class LanceNamespaceDBConnection(DBConnection):
         )
 
     @override
-    def drop_table(self, name: str, namespace_path: Optional[List[str]] = None):
+    def drop_table(
+        self,
+        name: str,
+        namespace_path: Optional[List[str]] = None,
+        ignore_missing: bool = False,
+    ):
         if namespace_path is None:
             namespace_path = []
-        LOOP.run(self._inner.drop_table(name, namespace_path=namespace_path))
+        LOOP.run(
+            self._inner.drop_table(
+                name, namespace_path=namespace_path, ignore_missing=ignore_missing
+            )
+        )
 
     @override
     def drop_table_async(

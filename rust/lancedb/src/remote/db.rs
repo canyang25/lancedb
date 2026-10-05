@@ -454,6 +454,24 @@ impl<S: HttpSend> RemoteDatabase<S> {
         Ok((request_id, resp))
     }
 
+    /// The drop route returns success when the table is already gone. Describe
+    /// it first so a missing table is [`Error::TableNotFound`].
+    async fn confirm_remote_table_exists(
+        &self,
+        name: &str,
+        namespace_path: &[String],
+    ) -> Result<()> {
+        let identifier = build_table_identifier(name, namespace_path)?;
+        let req = self
+            .client
+            .post(&format!("/v1/table/{}/describe/", identifier));
+        let (request_id, response) = self.client.send_with_retry(req, None, true).await?;
+        let response =
+            RemoteTable::<S>::handle_table_not_found(name, response, &request_id).await?;
+        self.client.check_response(&request_id, response).await?;
+        Ok(())
+    }
+
     /// Collect the tables of a namespace in name order, for `table_names`.
     ///
     /// `table_names` promises name order and resumes after a table name, but the namespace
@@ -1677,6 +1695,8 @@ impl<S: HttpSend> Database for RemoteDatabase<S> {
     }
 
     async fn drop_table(&self, name: &str, namespace_path: &[String]) -> Result<()> {
+        self.confirm_remote_table_exists(name, namespace_path)
+            .await?;
         self.submit_drop_table(name, namespace_path)
             .await
             .map(|_| ())
@@ -2627,16 +2647,56 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_table() {
-        let conn = Connection::new_with_handler(|request| {
+        use std::sync::Mutex;
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let recorded = paths.clone();
+        let conn = Connection::new_with_handler(move |request| {
             assert_eq!(request.method(), &reqwest::Method::POST);
-            assert_eq!(request.url().path(), "/v1/table/table1/drop/");
             assert_eq!(request.url().query(), None);
             assert!(request.body().is_none());
+            recorded
+                .lock()
+                .unwrap()
+                .push(request.url().path().to_string());
 
             http::Response::builder().status(200).body("").unwrap()
         });
         conn.drop_table("table1", &[]).await.unwrap();
-        // NOTE: the API will return 200 even if the table does not exist. So we shouldn't expect 404.
+        assert_eq!(
+            *paths.lock().unwrap(),
+            vec![
+                "/v1/table/table1/describe/".to_string(),
+                "/v1/table/table1/drop/".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_table_missing_is_table_not_found() {
+        use std::sync::Mutex;
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let recorded = paths.clone();
+        let conn = Connection::new_with_handler(move |request| {
+            recorded
+                .lock()
+                .unwrap()
+                .push(request.url().path().to_string());
+            http::Response::builder()
+                .status(404)
+                .body("table not found")
+                .unwrap()
+        });
+
+        let error = conn.drop_table("nope", &[]).await.unwrap_err();
+        assert!(
+            matches!(error, Error::TableNotFound { ref name, .. } if name == "nope"),
+            "{error:?}"
+        );
+        assert_eq!(error.to_string(), "Table 'nope' was not found");
+        assert_eq!(
+            *paths.lock().unwrap(),
+            vec!["/v1/table/nope/describe/".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -2855,17 +2915,60 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_table_with_namespace() {
-        let conn = Connection::new_with_handler(|request| {
+        use std::sync::Mutex;
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let recorded = paths.clone();
+        let conn = Connection::new_with_handler(move |request| {
             assert_eq!(request.method(), &reqwest::Method::POST);
-            assert_eq!(request.url().path(), "/v1/table/ns1$ns2$table1/drop/");
             assert_eq!(request.url().query(), None);
             assert!(request.body().is_none());
+            recorded
+                .lock()
+                .unwrap()
+                .push(request.url().path().to_string());
 
             http::Response::builder().status(200).body("").unwrap()
         });
         conn.drop_table("table1", &["ns1".to_string(), "ns2".to_string()])
             .await
             .unwrap();
+        assert_eq!(
+            *paths.lock().unwrap(),
+            vec![
+                "/v1/table/ns1$ns2$table1/describe/".to_string(),
+                "/v1/table/ns1$ns2$table1/drop/".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_missing_table_in_namespace_is_table_not_found() {
+        use std::sync::Mutex;
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let recorded = paths.clone();
+        let conn = Connection::new_with_handler(move |request| {
+            recorded
+                .lock()
+                .unwrap()
+                .push(request.url().path().to_string());
+            http::Response::builder()
+                .status(404)
+                .body("missing")
+                .unwrap()
+        });
+
+        let error = conn
+            .drop_table("nope", &["a".to_string()])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::TableNotFound { ref name, .. } if name == "nope"
+        ));
+        assert_eq!(
+            *paths.lock().unwrap(),
+            vec!["/v1/table/a$nope/describe/".to_string()]
+        );
     }
 
     #[tokio::test]

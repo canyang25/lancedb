@@ -125,6 +125,38 @@ describe("remote connection", () => {
     expect(requests).toEqual(["/v1/table/test/describe/"]);
   });
 
+  it("raises when dropping a missing table and still drops one that exists", async () => {
+    const requests: string[] = [];
+    await withMockDatabase(
+      (req, res) => {
+        requests.push(req.url ?? "");
+        if (req.url?.endsWith("/describe/") && req.url.includes("missing")) {
+          res.writeHead(404).end("table not found");
+          return;
+        }
+        res.writeHead(200, { "Content-Type": "application/json" }).end("{}");
+      },
+      async (db) => {
+        await expect(db.dropTable("missing")).rejects.toThrow(
+          "Table 'missing' was not found",
+        );
+        await expect(db.dropTable("missing", ["a"])).rejects.toThrow(
+          "Table 'missing' was not found",
+        );
+        await db.dropTable("present");
+        await db.dropTable("present", ["a"]);
+      },
+    );
+    expect(requests).toEqual([
+      "/v1/table/missing/describe/",
+      "/v1/table/a$missing/describe/",
+      "/v1/table/present/describe/",
+      "/v1/table/present/drop/",
+      "/v1/table/a$present/describe/",
+      "/v1/table/a$present/drop/",
+    ]);
+  });
+
   it.each([false, true])(
     "preserves an empty query's schema with an empty batch: %s",
     async (withEmptyBatch) => {

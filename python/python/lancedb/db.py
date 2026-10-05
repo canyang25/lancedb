@@ -714,7 +714,12 @@ class DBConnection(EnforceOverrides):
             "materialized views are not supported on this connection type"
         )
 
-    def drop_table(self, name: str, namespace_path: Optional[List[str]] = None):
+    def drop_table(
+        self,
+        name: str,
+        namespace_path: Optional[List[str]] = None,
+        ignore_missing: bool = False,
+    ):
         """Drop a table from the database.
 
         Parameters
@@ -724,6 +729,8 @@ class DBConnection(EnforceOverrides):
         namespace_path: List[str], default []
             The namespace to drop the table from.
             Empty list represents root namespace.
+        ignore_missing: bool, default False
+            If True, ignore if the table does not exist.
         """
         if namespace_path is None:
             namespace_path = []

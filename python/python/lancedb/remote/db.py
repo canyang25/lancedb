@@ -794,7 +794,12 @@ class RemoteDBConnection(DBConnection):
         return Job(job)
 
     @override
-    def drop_table(self, name: str, namespace_path: Optional[List[str]] = None):
+    def drop_table(
+        self,
+        name: str,
+        namespace_path: Optional[List[str]] = None,
+        ignore_missing: bool = False,
+    ):
         """Drop a table from the database.
 
         Parameters
@@ -804,10 +809,16 @@ class RemoteDBConnection(DBConnection):
         namespace_path: List[str], optional
             The namespace to drop the table from.
             None or empty list represents root namespace.
+        ignore_missing: bool, default False
+            If True, ignore if the table does not exist.
         """
         if namespace_path is None:
             namespace_path = []
-        LOOP.run(self._conn.drop_table(name, namespace_path=namespace_path))
+        LOOP.run(
+            self._conn.drop_table(
+                name, namespace_path=namespace_path, ignore_missing=ignore_missing
+            )
+        )
 
     @override
     def drop_table_async(

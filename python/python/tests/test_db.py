@@ -845,6 +845,9 @@ def test_delete_table(tmp_db: lancedb.DBConnection):
     tmp_db.create_table("test", data=data)
     assert tmp_db.table_names() == ["test"]
 
+    with pytest.raises(ValueError, match="Table 'does_not_exist' was not found"):
+        tmp_db.drop_table("does_not_exist")
+
     # dropping a table that does not exist should pass
     # if ignore_missing=True
     tmp_db.drop_table("does_not_exist", ignore_missing=True)
@@ -891,6 +894,10 @@ async def test_drop_table_async_connection(tmp_db_async: lancedb.AsyncConnection
     assert await job.status() == "finished"
     assert await job.wait() is None
     assert await tmp_db_async.table_names() == []
+
+    with pytest.raises(ValueError, match="Table 'does_not_exist' was not found"):
+        await tmp_db_async.drop_table("does_not_exist")
+    await tmp_db_async.drop_table("does_not_exist", ignore_missing=True)
 
 
 def test_drop_database(tmp_db: lancedb.DBConnection):

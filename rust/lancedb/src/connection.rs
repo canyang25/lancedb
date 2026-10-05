@@ -961,6 +961,12 @@ impl Connection {
     /// # Arguments
     /// * `name` - The name of the table to drop
     /// * `namespace_path` - The namespace path to drop the table from
+    ///
+    /// # Errors
+    ///
+    /// A remote database returns [`Error::TableNotFound`] when the table does
+    /// not exist. The server drop route is idempotent, so the client confirms
+    /// the table with describe before dropping it.
     pub async fn drop_table(&self, name: impl AsRef<str>, namespace_path: &[String]) -> Result<()> {
         self.internal
             .drop_table(name.as_ref(), namespace_path)

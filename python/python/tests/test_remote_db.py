@@ -120,6 +120,86 @@ async def test_async_remote_db():
         assert table_names == []
 
 
+def _drop_table_handler(requests):
+    def handler(request):
+        requests.append(request.path)
+        if request.path.endswith("/describe/"):
+            if "missing" in request.path:
+                request.send_response(404)
+                request.end_headers()
+                request.wfile.write(b"table not found")
+                return
+            request.send_response(200)
+            request.send_header("Content-Type", "application/json")
+            request.end_headers()
+            request.wfile.write(b"{}")
+            return
+        if request.path.endswith("/drop/"):
+            request.send_response(200)
+            request.end_headers()
+            request.wfile.write(b"{}")
+            return
+        request.send_response(404)
+        request.end_headers()
+
+    return handler
+
+
+def test_remote_drop_missing_table_matches_local():
+    requests = []
+    with mock_lancedb_connection(_drop_table_handler(requests)) as db:
+        with pytest.raises(ValueError, match="Table 'missing' was not found"):
+            db.drop_table("missing")
+        with pytest.raises(ValueError, match="Table 'missing' was not found"):
+            db.drop_table("missing", namespace_path=["a"])
+        db.drop_table("missing", ignore_missing=True)
+        db.drop_table("missing", namespace_path=["a"], ignore_missing=True)
+        db.drop_table("present")
+        db.drop_table("present", namespace_path=["a"], ignore_missing=True)
+
+    assert requests == [
+        "/v1/table/missing/describe/",
+        "/v1/table/a$missing/describe/",
+        "/v1/table/missing/describe/",
+        "/v1/table/a$missing/describe/",
+        "/v1/table/present/describe/",
+        "/v1/table/present/drop/",
+        "/v1/table/a$present/describe/",
+        "/v1/table/a$present/drop/",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_async_remote_drop_missing_table_matches_local():
+    requests = []
+    async with mock_lancedb_connection_async(_drop_table_handler(requests)) as db:
+        with pytest.raises(ValueError, match="Table 'missing' was not found"):
+            await db.drop_table("missing")
+        with pytest.raises(ValueError, match="Table 'missing' was not found"):
+            await db.drop_table("missing", namespace_path=["a"])
+        await db.drop_table("missing", ignore_missing=True)
+        await db.drop_table("present")
+
+    assert requests == [
+        "/v1/table/missing/describe/",
+        "/v1/table/a$missing/describe/",
+        "/v1/table/missing/describe/",
+        "/v1/table/present/describe/",
+        "/v1/table/present/drop/",
+    ]
+
+
+def test_remote_drop_does_not_ignore_describe_errors():
+    def handler(request):
+        request.send_response(400)
+        request.end_headers()
+        request.wfile.write(b"bad request")
+
+    with mock_lancedb_connection(handler) as db:
+        with pytest.raises(HttpError):
+            db.drop_table("present", ignore_missing=True)
+
+
 @pytest.mark.parametrize(
     "alteration, match",
     [
