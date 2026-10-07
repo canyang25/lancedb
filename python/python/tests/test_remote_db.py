@@ -21,7 +21,7 @@ from lancedb.conftest import MockNonNormTextEmbeddingFunction, MockTextEmbedding
 from lancedb.embeddings import EmbeddingFunctionConfig, EmbeddingFunctionRegistry
 from lancedb.query import AsyncQuery, ColumnOrdering, LanceVectorQueryBuilder
 from lancedb.remote import ClientConfig
-from lancedb.remote.errors import HttpError, RetryError
+from lancedb.remote.errors import HttpError, InvalidInputError, RetryError
 import pytest
 import pyarrow as pa
 
@@ -750,6 +750,127 @@ async def test_http_error():
 
         assert exc_info.value.request_id == request_id_holder["request_id"]
         assert "Internal Server Error" in str(exc_info.value)
+
+
+def test_remote_invalid_input_raises_value_error():
+    request_id_holder = {"request_id": None}
+
+    def handler(request):
+        if request.path.endswith("/describe/"):
+            request.send_response(200)
+            request.send_header("Content-Type", "application/json")
+            request.end_headers()
+            request.wfile.write(b'{"version": 1, "schema": {"fields": []}}')
+            return
+
+        request_id_holder["request_id"] = request.headers["x-request-id"]
+        request.send_response(400)
+        request.send_header("Content-Type", "application/json")
+        request.end_headers()
+        # Numeric code is the namespace InvalidInput error code.
+        request.wfile.write(
+            json.dumps(
+                {
+                    "code": 13,
+                    "error": (
+                        "Bad request: InvalidArgument: Invalid input, "
+                        "Schema error: No field named nope"
+                    ),
+                }
+            ).encode()
+        )
+
+    with mock_lancedb_connection(handler) as db:
+        table = db.open_table("test")
+        with pytest.raises(ValueError, match="No field named nope") as exc_info:
+            table.count_rows("nope > 3")
+
+        err = exc_info.value
+        assert isinstance(err, InvalidInputError)
+        assert isinstance(err, ValueError)
+        assert not isinstance(err, HttpError)
+        assert err.request_id == request_id_holder["request_id"]
+        assert err.status_code == 400
+        message = str(err)
+        assert message == "Invalid input, Schema error: No field named nope"
+        assert "request_id" not in message
+        assert "Bad request" not in message
+        assert "InvalidArgument" not in message
+        assert message.count("Invalid input") == 1
+
+
+def test_remote_memwal_row_id_refusal_is_not_supported():
+    def handler(request):
+        if request.path.endswith("/describe/"):
+            request.send_response(200)
+            request.send_header("Content-Type", "application/json")
+            request.end_headers()
+            request.wfile.write(b'{"version": 1, "schema": {"fields": []}}')
+            return
+
+        request.send_response(400)
+        request.send_header("Content-Type", "application/json")
+        request.end_headers()
+        request.wfile.write(
+            json.dumps(
+                {
+                    "code": 13,
+                    "error": (
+                        "Bad request: the MemWAL LSM scanner does not support "
+                        "with_row_id (the LSM scanner exposes _rowaddr, not a "
+                        "stable _rowid)"
+                    ),
+                }
+            ).encode()
+        )
+
+    with mock_lancedb_connection(handler) as db:
+        table = db.open_table("test")
+        with pytest.raises(
+            NotImplementedError, match="does not support with_row_id"
+        ) as exc_info:
+            table.count_rows("id > 0")
+
+        message = str(exc_info.value)
+        assert not isinstance(exc_info.value, ValueError)
+        assert "Bad request" not in message
+        assert "Invalid input" not in message
+        assert "request_id" not in message
+
+
+def test_remote_other_bad_request_stays_http_error():
+    def handler(request):
+        if request.path.endswith("/describe/"):
+            request.send_response(200)
+            request.send_header("Content-Type", "application/json")
+            request.end_headers()
+            request.wfile.write(b'{"version": 1, "schema": {"fields": []}}')
+            return
+
+        request.send_response(400)
+        request.send_header("Content-Type", "application/json")
+        request.end_headers()
+        request.wfile.write(b'{"code":21,"error":"Too many concurrent writes"}')
+
+    with mock_lancedb_connection(handler) as db:
+        table = db.open_table("test")
+        with pytest.raises(HttpError) as exc_info:
+            table.count_rows("id > 0")
+        assert exc_info.value.status_code == 400
+
+
+def test_remote_checked_out_table_mutation_is_value_error():
+    def handler(request):
+        request.send_response(200)
+        request.send_header("Content-Type", "application/json")
+        request.end_headers()
+        request.wfile.write(b'{"version": 1, "schema": {"fields": []}}')
+
+    with mock_lancedb_connection(handler) as db:
+        table = db.open_table("test")
+        table.checkout(1)
+        with pytest.raises(ValueError, match="fixed at version 1"):
+            table.delete("id = 1")
 
 
 @pytest.mark.asyncio

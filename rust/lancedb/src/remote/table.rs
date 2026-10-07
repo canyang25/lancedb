@@ -1298,7 +1298,9 @@ impl<S: HttpSend> RemoteTable<S> {
         let read_guard = self.version.read().await;
         match *read_guard {
             None => Ok(()),
-            Some(version) => Err(Error::NotSupported {
+            // Same class as local `ensure_mutable`: writing to a checked-out
+            // version is misuse, not an unsupported feature.
+            Some(version) => Err(Error::InvalidInput {
                 message: format!(
                     "Cannot mutate table reference fixed at version {}. Call checkout_latest() to get a mutable table reference.",
                     version
@@ -1449,7 +1451,10 @@ impl<S: HttpSend> RemoteTable<S> {
         let status_code = match error {
             Error::Http { status_code, .. } => *status_code,
             Error::Retry { status_code, .. } => *status_code,
-            _ => None,
+            _ => error
+                .remote_invalid_input_context()
+                .or_else(|| error.remote_not_supported_context())
+                .and_then(|(_, status)| StatusCode::from_u16(status).ok()),
         };
         if let Some(status_code) = status_code
             && Self::should_invalidate_cache_for_status(status_code)
@@ -8310,7 +8315,8 @@ mod tests {
 
         table.checkout(42).await.unwrap();
 
-        // Ensure that all mutable operations fail.
+        // Ensure that all mutable operations fail as invalid input, matching
+        // a local table checked out at a version.
         let res = table
             .update()
             .column("a", "a + 1")
@@ -8318,7 +8324,15 @@ mod tests {
             .only_if("b > 10")
             .execute()
             .await;
-        assert!(matches!(res, Err(Error::NotSupported { .. })));
+        let err = res.expect_err("checked-out table must refuse writes");
+        match &err {
+            Error::InvalidInput { message } => {
+                assert!(message.contains("fixed at version 42"), "{message}");
+                assert!(message.contains("checkout_latest()"), "{message}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        assert!(err.to_string().starts_with("Invalid input, "), "{err}");
 
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
@@ -8330,10 +8344,10 @@ mod tests {
             batch.schema(),
         ));
         let res = table.merge_insert(&["some_col"]).execute(data).await;
-        assert!(matches!(res, Err(Error::NotSupported { .. })));
+        assert!(matches!(res, Err(Error::InvalidInput { .. })));
 
         let res = table.delete("id in (1, 2, 3)").await;
-        assert!(matches!(res, Err(Error::NotSupported { .. })));
+        assert!(matches!(res, Err(Error::InvalidInput { .. })));
 
         let data = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
@@ -8341,13 +8355,13 @@ mod tests {
         )
         .unwrap();
         let res = table.add(data.clone()).execute().await;
-        assert!(matches!(res, Err(Error::NotSupported { .. })));
+        assert!(matches!(res, Err(Error::InvalidInput { .. })));
 
         let res = table
             .create_index(&["a"], Index::IvfPq(Default::default()))
             .execute()
             .await;
-        assert!(matches!(res, Err(Error::NotSupported { .. })));
+        assert!(matches!(res, Err(Error::InvalidInput { .. })));
     }
 
     #[rstest]
@@ -10805,6 +10819,57 @@ mod tests {
         }
     }
 
+    /// `refresh_column_async` checks the response directly, so a namespace
+    /// invalid-input 400 has to invalidate the schema cache through the
+    /// context carried on `Error::InvalidInput`.
+    #[tokio::test]
+    async fn test_invalid_input_on_refresh_column_invalidates_schema_cache() {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+        let code = lance_namespace::error::ErrorCode::InvalidInput.as_u32();
+        let body = format!(
+            r#"{{"code":{code},"error":"Bad request: InvalidArgument: Invalid input, Schema error: No field named nope"}}"#
+        );
+
+        let table =
+            Table::new_with_handler("my_table", move |request| match request.url().path() {
+                "/v1/table/my_table/describe/" => {
+                    call_count_clone.fetch_add(1, Ordering::SeqCst);
+                    http::Response::builder()
+                        .status(200)
+                        .body(
+                            r#"{"version": 1, "schema": {"fields": [
+                                {"name": "a", "type": { "type": "int32" }, "nullable": false}
+                            ]}}"#
+                                .to_string(),
+                        )
+                        .unwrap()
+                }
+                "/v1/table/my_table/backfill_column" => http::Response::builder()
+                    .status(400)
+                    .body(body.clone())
+                    .unwrap(),
+                path => panic!("unexpected request: {path}"),
+            });
+
+        let schema1 = table.schema().await.unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        let schema2 = table.schema().await.unwrap();
+        assert_eq!(Arc::as_ptr(&schema2), Arc::as_ptr(&schema1));
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        let err = table.refresh_column_async("a").await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert_eq!(
+            err.remote_invalid_input_context().map(|(_, status)| status),
+            Some(400)
+        );
+
+        let schema3 = table.schema().await.unwrap();
+        assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        assert_ne!(Arc::as_ptr(&schema3), Arc::as_ptr(&schema1));
+    }
+
     /// A pinned snapshot should reuse the version and schema returned by its
     /// initial describe instead of issuing two more describe requests.
     #[tokio::test]
@@ -11372,6 +11437,40 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), 2);
         // The error from the failed fetch should be propagated
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_count_rows_invalid_input_code_is_invalid_input() {
+        let code = lance_namespace::error::ErrorCode::InvalidInput.as_u32();
+        let body = format!(
+            r#"{{"code":{code},"error":"Bad request: InvalidArgument: Invalid input, Schema error: No field named nope"}}"#
+        );
+        let table = Table::new_with_handler("my_table", move |request| {
+            assert_eq!(request.url().path(), "/v1/table/my_table/count_rows/");
+            http::Response::builder()
+                .status(400)
+                .body(body.clone())
+                .unwrap()
+        });
+
+        let err = table
+            .count_rows(Some("nope > 3".to_string()))
+            .await
+            .unwrap_err();
+        let displayed = err.to_string();
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert_eq!(
+            displayed, "Invalid input, Schema error: No field named nope",
+            "{displayed}"
+        );
+        assert!(!displayed.contains("request_id"), "{displayed}");
+        assert!(!displayed.contains("Bad request"), "{displayed}");
+        assert!(!displayed.contains("InvalidArgument"), "{displayed}");
+        let (request_id, status_code) = err
+            .remote_invalid_input_context()
+            .expect("remote invalid input keeps request context");
+        assert!(!request_id.is_empty(), "{request_id}");
+        assert_eq!(status_code, 400);
     }
 
     #[tokio::test]

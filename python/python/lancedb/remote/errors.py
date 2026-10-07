@@ -31,6 +31,36 @@ class LanceDBClientError(RuntimeError):
         return (self.__class__, (str(self), self.request_id, self.status_code))
 
 
+class InvalidInputError(ValueError):
+    """Invalid input reported by a remote LanceDB server.
+
+    This is a ``ValueError`` so ``except ValueError`` written against a
+    local table also catches the same mistake on a remote table.
+    ``request_id`` and ``status_code`` are available the same way they are
+    on other remote HTTP errors.
+
+    Attributes
+    ----------
+    message: str
+        The error message, without the HTTP or JSON wrapper.
+    request_id: str
+        The id of the request that failed. This can be provided in error reports
+        to help diagnose the issue.
+    status_code: Optional[int]
+        The HTTP status code of the response. May be None.
+    """
+
+    def __init__(
+        self, message: str, request_id: str, status_code: Optional[int] = None
+    ):
+        super().__init__(message)
+        self.request_id = request_id
+        self.status_code = status_code
+
+    def __reduce__(self) -> tuple[type, tuple]:
+        return (self.__class__, (str(self), self.request_id, self.status_code))
+
+
 class HttpError(LanceDBClientError):
     """An error that occurred during an HTTP request.
 

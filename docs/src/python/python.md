@@ -350,6 +350,8 @@ still work. Queries return descriptors. Call
 
 ::: lancedb.exceptions.JobCancelledError
 
+::: lancedb.remote.errors.InvalidInputError
+
 ## Integrations
 
 ## Pydantic

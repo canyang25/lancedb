@@ -3,7 +3,12 @@
 
 import pickle
 
-from lancedb.remote.errors import HttpError, LanceDBClientError, RetryError
+from lancedb.remote.errors import (
+    HttpError,
+    InvalidInputError,
+    LanceDBClientError,
+    RetryError,
+)
 
 
 def test_pickle_lancedb_client_error():
@@ -20,6 +25,18 @@ def test_pickle_lancedb_client_error_no_status_code():
     assert str(restored) == "fail"
     assert restored.request_id == "req-456"
     assert restored.status_code is None
+
+
+def test_pickle_invalid_input_error():
+    err = InvalidInputError(
+        "Invalid input, Schema error: No field named nope", "req-400", 400
+    )
+    restored = pickle.loads(pickle.dumps(err))
+    assert isinstance(restored, InvalidInputError)
+    assert isinstance(restored, ValueError)
+    assert str(restored) == "Invalid input, Schema error: No field named nope"
+    assert restored.request_id == "req-400"
+    assert restored.status_code == 400
 
 
 def test_pickle_http_error():

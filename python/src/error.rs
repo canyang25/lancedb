@@ -23,6 +23,20 @@ pub trait PythonErrorExt<T> {
 
 impl<T> PythonErrorExt<T> for std::result::Result<T, LanceError> {
     fn infer_error(self) -> PyResult<T> {
+        if let Err(err) = &self {
+            if let Some((request_id, status_code)) = err.remote_invalid_input_context() {
+                let request_id = request_id.to_string();
+                let message = err.to_string();
+                return Python::attach(|py| {
+                    let cls = py
+                        .import(intern!(py, "lancedb.remote.errors"))?
+                        .getattr(intern!(py, "InvalidInputError"))?;
+                    let py_err = cls.call1((message, request_id, status_code))?;
+                    Err(PyErr::from_value(py_err))
+                });
+            }
+        }
+
         match &self {
             Ok(_) => Ok(self.unwrap()),
             Err(err) => match err {

@@ -55,7 +55,7 @@ impl Display for JobFailure {
 pub enum Error {
     #[snafu(display("Invalid table name (\"{name}\"): {reason}"))]
     InvalidTableName { name: String, reason: String },
-    #[snafu(display("Invalid input, {message}"))]
+    #[snafu(display("Invalid input, {}", message_without_remote_context(message)))]
     InvalidInput { message: String },
     #[snafu(display("Table '{name}' was not found"))]
     TableNotFound { name: String, source: BoxError },
@@ -143,7 +143,10 @@ pub enum Error {
     },
     #[snafu(display("Arrow error: {source}"))]
     Arrow { source: ArrowError },
-    #[snafu(display("LanceDBError: not supported: {message}"))]
+    #[snafu(display(
+        "LanceDBError: not supported: {}",
+        message_without_remote_context(message)
+    ))]
     NotSupported { message: String },
     /// External error pass through from user code.
     #[snafu(transparent)]
@@ -220,7 +223,91 @@ fn has_unsupported_local_filesystem_source(error: &(dyn std::error::Error + 'sta
     false
 }
 
+/// Splits remote HTTP context off an error message.
+///
+/// The context is stored on the message so [`Error::InvalidInput`] and a
+/// remote [`Error::NotSupported`] keep their shapes, and omitted from
+/// [`Display`]. Bindings read the invalid-input case back for exception
+/// attributes.
+const REMOTE_CONTEXT_MARK: &str = "\u{1e}lancedb_remote_context:";
+
+fn message_without_remote_context(message: &str) -> &str {
+    message
+        .rsplit_once(REMOTE_CONTEXT_MARK)
+        .map(|(text, _)| text)
+        .unwrap_or(message)
+}
+
+fn message_with_remote_context(
+    message: impl Into<String>,
+    request_id: &str,
+    status_code: u16,
+) -> String {
+    format!(
+        "{}{REMOTE_CONTEXT_MARK}request_id={request_id};status_code={status_code}",
+        message.into()
+    )
+}
+
+fn parse_remote_context(message: &str) -> Option<(&str, u16)> {
+    let (_, meta) = message.rsplit_once(REMOTE_CONTEXT_MARK)?;
+    let rest = meta.strip_prefix("request_id=")?;
+    let (request_id, status) = rest.rsplit_once(";status_code=")?;
+    if request_id.is_empty() {
+        return None;
+    }
+    Some((request_id, status.parse().ok()?))
+}
+
 impl Error {
+    /// Invalid input raised from a remote HTTP response.
+    ///
+    /// `request_id` and `status_code` stay available through
+    /// [`Self::remote_invalid_input_context`] and are not part of [`Display`].
+    pub(crate) fn invalid_input_with_remote_context(
+        message: impl Into<String>,
+        request_id: &str,
+        status_code: u16,
+    ) -> Self {
+        Self::InvalidInput {
+            message: message_with_remote_context(message, request_id, status_code),
+        }
+    }
+
+    /// A remote refusal mapped to [`Error::NotSupported`], keeping the HTTP
+    /// status available without putting it in [`Display`].
+    pub(crate) fn not_supported_with_remote_context(
+        message: impl Into<String>,
+        request_id: &str,
+        status_code: u16,
+    ) -> Self {
+        Self::NotSupported {
+            message: message_with_remote_context(message, request_id, status_code),
+        }
+    }
+
+    /// Request id and HTTP status for a remote invalid-input error.
+    ///
+    /// Local invalid-input errors return `None`.
+    #[doc(hidden)]
+    pub fn remote_invalid_input_context(&self) -> Option<(&str, u16)> {
+        match self {
+            Self::InvalidInput { message } => parse_remote_context(message),
+            _ => None,
+        }
+    }
+
+    /// Request id and HTTP status for a remote [`Error::NotSupported`] that
+    /// was mapped from the same response shape as invalid input.
+    ///
+    /// Local unsupported errors return `None`.
+    pub(crate) fn remote_not_supported_context(&self) -> Option<(&str, u16)> {
+        match self {
+            Self::NotSupported { message } => parse_remote_context(message),
+            _ => None,
+        }
+    }
+
     fn from_box_error(mut source: Box<dyn std::error::Error + Send + Sync>) -> Self {
         source = match source.downcast::<Self>() {
             Ok(e) => match *e {
@@ -313,6 +400,51 @@ impl From<candle_core::Error> for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_invalid_input_context_is_hidden_from_display() {
+        let err = Error::invalid_input_with_remote_context(
+            "Schema error: No field named nope",
+            "req-1",
+            400,
+        );
+        assert_eq!(
+            err.to_string(),
+            "Invalid input, Schema error: No field named nope"
+        );
+        assert_eq!(err.remote_invalid_input_context(), Some(("req-1", 400)));
+        assert!(!err.to_string().contains("req-1"));
+        assert!(!err.to_string().contains("lancedb_remote_context"));
+    }
+
+    #[test]
+    fn local_invalid_input_has_no_remote_context() {
+        let err = Error::InvalidInput {
+            message: "nprobes must be greater than 0".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Invalid input, nprobes must be greater than 0"
+        );
+        assert!(err.remote_invalid_input_context().is_none());
+    }
+
+    #[test]
+    fn remote_not_supported_context_is_hidden_from_display() {
+        let err = Error::not_supported_with_remote_context(
+            "the MemWAL LSM scanner does not support with_row_id",
+            "req-wal",
+            400,
+        );
+        assert_eq!(
+            err.to_string(),
+            "LanceDBError: not supported: the MemWAL LSM scanner does not support with_row_id"
+        );
+        assert_eq!(err.remote_not_supported_context(), Some(("req-wal", 400)));
+        assert!(err.remote_invalid_input_context().is_none());
+        assert!(!err.to_string().contains("req-wal"));
+        assert!(!err.to_string().contains("lancedb_remote_context"));
+    }
 
     #[test]
     fn unsupported_filesystem_operations_have_actionable_error() {

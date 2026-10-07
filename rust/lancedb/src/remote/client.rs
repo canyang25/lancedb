@@ -9,6 +9,8 @@ use reqwest::{
 };
 use std::{collections::HashMap, future::Future, str::FromStr, sync::Arc, time::Duration};
 
+use lance_namespace::error::ErrorCode;
+
 use crate::error::{Error, Result};
 use crate::remote::db::RemoteOptions;
 use crate::remote::retry::{ResolvedRetryConfig, RetryCounter};
@@ -971,6 +973,11 @@ impl<S: HttpSend> RestfulLanceDbClient<S> {
             Ok(response)
         } else {
             let response_text = response.text().await.ok();
+            if let Some(body) = response_text.as_deref()
+                && let Some(err) = invalid_input_from_bad_request(request_id, status, body)
+            {
+                return Err(err);
+            }
             let message = if let Some(response_text) = response_text {
                 format!("{}: {}", status, response_text)
             } else {
@@ -983,6 +990,110 @@ impl<S: HttpSend> RestfulLanceDbClient<S> {
             })
         }
     }
+}
+
+/// Prefixes the server adds around the detail a local table would raise.
+const SERVER_ERROR_PREFIXES: &[&str] = &[
+    "Bad request:",
+    "InvalidArgument:",
+    "INVALID_ARGUMENT:",
+    "Invalid user input:",
+    "Invalid input:",
+    "Invalid input,",
+];
+
+/// The MemWAL `_rowid` refusal. Hybrid search keys off this same sentence and
+/// treats it as unsupported, not as bad user input.
+const WAL_ROW_ID_REFUSAL: &str = "does not support with_row_id";
+
+fn parse_remote_error_code(code: &serde_json::Value) -> Option<ErrorCode> {
+    match code {
+        serde_json::Value::Number(number) => {
+            let code = u32::try_from(number.as_u64()?).ok()?;
+            ErrorCode::from_u32(code)
+        }
+        serde_json::Value::String(code) => {
+            if let Ok(code) = code.parse::<u32>() {
+                ErrorCode::from_u32(code)
+            } else if code.as_str() == ErrorCode::InvalidInput.to_string() {
+                Some(ErrorCode::InvalidInput)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Peel server wrappers so [`Error::InvalidInput`]'s `Invalid input, ` prefix
+/// lines up with the message a local table raises.
+fn strip_server_error_prefixes(error_text: &str) -> String {
+    let original = error_text.trim();
+    let mut text = original;
+    loop {
+        let mut stripped = false;
+        for wrapper in SERVER_ERROR_PREFIXES {
+            if let Some(rest) = text.strip_prefix(wrapper) {
+                let rest = rest.trim();
+                if rest.len() < text.len() {
+                    text = rest;
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    if text.is_empty() {
+        original.to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn invalid_input_detail(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if parse_remote_error_code(value.get("code")?) != Some(ErrorCode::InvalidInput) {
+        return None;
+    }
+    let raw = value
+        .get("error")
+        .and_then(|error| error.as_str())
+        .filter(|error| !error.is_empty());
+    Some(match raw {
+        Some(error) => strip_server_error_prefixes(error),
+        None => "the server rejected this request".to_string(),
+    })
+}
+
+/// Map an HTTP 400 whose JSON `code` is [`ErrorCode::InvalidInput`] to
+/// [`Error::InvalidInput`].
+///
+/// The MemWAL row-id refusal uses that same code but is [`Error::NotSupported`].
+/// `request_id` and the status are kept off the user-facing message.
+fn invalid_input_from_bad_request(
+    request_id: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Option<Error> {
+    if status != reqwest::StatusCode::BAD_REQUEST {
+        return None;
+    }
+    let detail = invalid_input_detail(body)?;
+    if detail.contains(WAL_ROW_ID_REFUSAL) {
+        return Some(Error::not_supported_with_remote_context(
+            detail,
+            request_id,
+            status.as_u16(),
+        ));
+    }
+    Some(Error::invalid_input_with_remote_context(
+        detail,
+        request_id,
+        status.as_u16(),
+    ))
 }
 
 pub trait RequestResultExt {
@@ -1896,5 +2007,178 @@ mod tests {
             std::env::remove_var("LANCE_CLIENT_MAX_REQUEST_DURATION");
         }
         assert!(matches!(err, Error::InvalidInput { .. }), "got: {err:?}");
+    }
+
+    fn invalid_input_body(code: impl std::fmt::Display, error: &str) -> String {
+        let error = serde_json::to_string(error).unwrap();
+        format!(r#"{{"code":{code},"error":{error}}}"#)
+    }
+
+    #[tokio::test]
+    async fn test_bad_request_invalid_input_code_maps_to_invalid_input() {
+        let client = test_utils::client_with_handler(|_request| {
+            http::Response::builder()
+                .status(200)
+                .body(String::new())
+                .unwrap()
+        });
+        let code = ErrorCode::InvalidInput.as_u32();
+        let named = ErrorCode::InvalidInput.to_string();
+
+        let cases = [
+            (
+                invalid_input_body(
+                    code,
+                    "Bad request: InvalidArgument: Invalid input, Schema error: No field named nope",
+                ),
+                "Invalid input, Schema error: No field named nope",
+            ),
+            (
+                invalid_input_body(
+                    code,
+                    "Bad request: Invalid user input: The merge insert job is not configured",
+                ),
+                "Invalid input, The merge insert job is not configured",
+            ),
+            (
+                invalid_input_body(
+                    code,
+                    "Bad request: Invalid input, query dim(3) doesn't match",
+                ),
+                "Invalid input, query dim(3) doesn't match",
+            ),
+            (
+                invalid_input_body(
+                    format!("\"{named}\""),
+                    "Bad request: InvalidArgument: Invalid input, Column id already exists in the dataset",
+                ),
+                "Invalid input, Column id already exists in the dataset",
+            ),
+            (
+                invalid_input_body(
+                    format!("\"{code}\""),
+                    "Bad request: InvalidArgument: Ref conflict error: tag v1 already exists",
+                ),
+                "Invalid input, Ref conflict error: tag v1 already exists",
+            ),
+        ];
+
+        for (body, expected) in cases {
+            let response = http::Response::builder()
+                .status(400)
+                .body(body)
+                .unwrap()
+                .into();
+            let err = client
+                .check_response("req-1", response)
+                .await
+                .expect_err("invalid input must be an error");
+            let Error::InvalidInput { .. } = &err else {
+                panic!("expected InvalidInput, got {err:?}");
+            };
+            let displayed = err.to_string();
+            assert_eq!(displayed, expected);
+            assert!(!displayed.contains("request_id"), "{displayed}");
+            assert!(!displayed.contains("Bad request"), "{displayed}");
+            assert!(!displayed.contains("InvalidArgument"), "{displayed}");
+            assert!(
+                !displayed.contains("Invalid input, Invalid input"),
+                "{displayed}"
+            );
+            assert_eq!(
+                err.remote_invalid_input_context(),
+                Some(("req-1", 400)),
+                "{err:?}"
+            );
+        }
+
+        let wal_body = invalid_input_body(
+            code,
+            "Bad request: the MemWAL LSM scanner does not support with_row_id (the LSM scanner exposes _rowaddr, not a stable _rowid)",
+        );
+        let response = http::Response::builder()
+            .status(400)
+            .body(wal_body)
+            .unwrap()
+            .into();
+        let err = client
+            .check_response("req-wal", response)
+            .await
+            .expect_err("memwal refusal must be an error");
+        match &err {
+            Error::NotSupported { message } => {
+                assert!(
+                    message.contains("does not support with_row_id"),
+                    "{message}"
+                );
+                assert!(!message.contains("Bad request"), "{message}");
+            }
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
+        let displayed = err.to_string();
+        assert!(
+            displayed.starts_with("LanceDBError: not supported:"),
+            "{displayed}"
+        );
+        assert!(!displayed.contains("Invalid input"), "{displayed}");
+        assert!(!displayed.contains("request_id"), "{displayed}");
+        assert!(!displayed.contains("lancedb_remote_context"), "{displayed}");
+        assert!(err.remote_invalid_input_context().is_none());
+        assert_eq!(err.remote_not_supported_context(), Some(("req-wal", 400)));
+
+        let throttling = ErrorCode::Throttling.as_u32();
+        let stays_http = [
+            (400, "bad request".to_string()),
+            (400, r#"{"error":"not empty"}"#.to_string()),
+            (
+                400,
+                r#"{"code":"InvalidArgument","error":"InvalidArgument: nope"}"#.to_string(),
+            ),
+            (
+                400,
+                format!(r#"{{"code":{throttling},"error":"Too many concurrent writes"}}"#),
+            ),
+            (
+                500,
+                invalid_input_body(
+                    code,
+                    "Bad request: InvalidArgument: Invalid input, Schema error: No field named nope",
+                ),
+            ),
+        ];
+        for (status, body) in stays_http {
+            let response = http::Response::builder()
+                .status(status)
+                .body(body.clone())
+                .unwrap()
+                .into();
+            let err = client
+                .check_response("req-2", response)
+                .await
+                .expect_err("non-success must be an error");
+            match &err {
+                Error::Http { status_code, .. } => {
+                    assert_eq!(status_code.unwrap().as_u16(), status, "{err}");
+                }
+                other => panic!("expected Http error for {body}, got {other:?}"),
+            }
+            assert!(err.to_string().contains(&body), "{err}");
+        }
+
+        let response = http::Response::builder()
+            .status(400)
+            .body(format!(r#"{{"code":{code}}}"#))
+            .unwrap()
+            .into();
+        let err = client
+            .check_response("req-3", response)
+            .await
+            .expect_err("invalid input code must be an error");
+        assert!(matches!(err, Error::InvalidInput { .. }), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "Invalid input, the server rejected this request"
+        );
+        assert_eq!(err.remote_invalid_input_context(), Some(("req-3", 400)));
     }
 }
